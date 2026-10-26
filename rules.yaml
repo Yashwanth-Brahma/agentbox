@@ -1,0 +1,17 @@
+default: allow
+rules:
+  - name: no-deletes
+    tool: "delete_*"
+    decision: block
+
+  - name: big-refunds
+    tool: "refund"
+    when:
+      amount: { gt: 5000 }
+    decision: ask
+
+  - name: readonly-sql
+    tool: "run_sql"
+    when:
+      query: { matches: "*DROP*" }
+    decision: block
