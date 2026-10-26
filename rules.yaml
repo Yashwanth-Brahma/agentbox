@@ -15,3 +15,13 @@ rules:
     when:
       query: { matches: "*DROP*" }
     decision: block
+
+chains:
+  - name: no-send-after-secrets
+    after:
+      tool: "read_file"
+      when:
+        path: { matches: "*.env*" }
+    then:
+      tool: "send_*"
+      decision: block

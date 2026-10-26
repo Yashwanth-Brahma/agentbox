@@ -336,3 +336,107 @@ def test_package_exports_guard():
 
     assert agentbox.configure is configure
     assert agentbox.GuardBlocked is GuardBlocked
+
+
+# --- chain rules connected to @record ---
+
+sent = []  # emails the fake send_email actually sent
+
+
+@record
+def read_file(path):
+    if path == "missing.env":
+        raise FileNotFoundError(path)
+    return f"contents of {path}"
+
+
+@record
+def send_email(to, body):
+    sent.append((to, body))
+    return "sent"
+
+
+CHAIN_RULES = """
+chains:
+  - name: no-send-after-secrets
+    after:
+      tool: read_file
+      when:
+        path: { matches: "*.env*" }
+    then:
+      tool: "send_*"
+      decision: block
+"""
+
+
+@pytest.fixture(autouse=True)
+def clear_sent():
+    sent.clear()
+
+
+def test_env_read_then_send_is_blocked(db_path, use_rules):
+    use_rules(CHAIN_RULES)
+    with run("r", db_path=db_path) as run_id:
+        read_file(".env")
+        with pytest.raises(GuardBlocked) as caught:
+            send_email("a@b.c", "secrets")
+
+    assert sent == []
+    assert caught.value.rule_name == "no-send-after-secrets"
+    read, send = actions_for(db_path, run_id)
+    assert (read["status"], read["rule_name"]) == ("ok", None)
+    assert (send["status"], send["rule_name"]) == ("blocked", "no-send-after-secrets")
+
+
+def test_send_without_read_is_allowed(db_path, use_rules):
+    use_rules(CHAIN_RULES)
+    with run("r", db_path=db_path):
+        assert send_email("a@b.c", "hi") == "sent"
+    assert sent == [("a@b.c", "hi")]
+
+
+def test_other_file_read_does_not_fire(db_path, use_rules):
+    use_rules(CHAIN_RULES)
+    with run("r", db_path=db_path):
+        read_file("notes.txt")
+        assert send_email("a@b.c", "hi") == "sent"
+
+
+def test_blocked_env_read_does_not_fire(db_path, use_rules):
+    use_rules(
+        CHAIN_RULES
+        + """
+rules:
+  - name: no-env
+    tool: read_file
+    when:
+      path: { matches: "*.env*" }
+    decision: block
+"""
+    )
+    with run("r", db_path=db_path) as run_id:
+        with pytest.raises(GuardBlocked):
+            read_file(".env")
+        assert send_email("a@b.c", "hi") == "sent"
+
+    read, send = actions_for(db_path, run_id)
+    assert read["status"] == "blocked"
+    assert send["status"] == "ok"
+
+
+def test_failed_env_read_does_not_fire(db_path, use_rules):
+    use_rules(CHAIN_RULES)
+    with run("r", db_path=db_path):
+        with pytest.raises(FileNotFoundError):
+            read_file("missing.env")
+        assert send_email("a@b.c", "hi") == "sent"
+
+
+def test_runs_do_not_share_fired_chains(db_path, use_rules):
+    use_rules(CHAIN_RULES)
+    with run("first", db_path=db_path):
+        read_file(".env")
+        with pytest.raises(GuardBlocked):
+            send_email("a@b.c", "x")
+    with run("second", db_path=db_path):
+        assert send_email("a@b.c", "hi") == "sent"

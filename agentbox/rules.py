@@ -10,6 +10,7 @@ import yaml
 
 DECISIONS = {"allow", "block", "ask"}
 RULE_KEYS = {"name", "tool", "when", "decision"}
+CHAIN_KEYS = {"name", "after", "then"}
 
 
 def _contains(actual, expected) -> bool:
@@ -56,27 +57,53 @@ class Rule:
 
     def matches(self, tool_name: str, args: dict) -> bool:
         """True if the tool name matches and every condition holds."""
-        if not fnmatchcase(tool_name, self.tool):
-            return False
-        for arg_name, (op, expected) in self.when.items():
-            if arg_name not in args:
-                return False
-            if not _check(op, args[arg_name], expected):
-                return False
-        return True
+        return _call_matches(self.tool, self.when, tool_name, args)
+
+
+@dataclass
+class Chain:
+    """After `after_tool` succeeds in a run, apply `decision` to `then_tool`."""
+
+    name: str
+    after_tool: str
+    then_tool: str
+    decision: str
+    after_when: dict[str, tuple[str, object]] = field(default_factory=dict)
+
+    def fired_by(self, tool_name: str, args: dict) -> bool:
+        """True if this call (once it succeeds) fires the chain."""
+        return _call_matches(self.after_tool, self.after_when, tool_name, args)
+
+    def applies_to(self, tool_name: str) -> bool:
+        """True if a fired chain should decide for this tool."""
+        return fnmatchcase(tool_name, self.then_tool)
 
 
 @dataclass
 class Rules:
     default: str = "allow"
     rules: list[Rule] = field(default_factory=list)
+    chains: list[Chain] = field(default_factory=list)
 
-    def decide(self, tool_name: str, args: dict) -> Decision:
-        """Return the decision of the first matching rule, else the default."""
+    def decide(
+        self, tool_name: str, args: dict, fired: set[str] | frozenset = frozenset()
+    ) -> Decision:
+        """Decide for one call. `fired` holds the names of chains fired in this run.
+
+        Fired chains are checked first, then normal rules (first match wins),
+        then the default.
+        """
+        for chain in self.chains:
+            if chain.name in fired and chain.applies_to(tool_name):
+                return Decision(chain.decision, chain.name)
         for rule in self.rules:
             if rule.matches(tool_name, args):
                 return Decision(rule.decision, rule.name)
         return Decision(self.default, None)
+
+    def chains_fired_by(self, tool_name: str, args: dict) -> set[str]:
+        """Names of the chains that a successful call like this one fires."""
+        return {c.name for c in self.chains if c.fired_by(tool_name, args)}
 
 
 def load_rules(path: str | Path) -> Rules:
@@ -87,6 +114,18 @@ def load_rules(path: str | Path) -> Rules:
     except yaml.YAMLError as e:
         raise RulesError(f"invalid YAML in {path}: {e}") from e
     return _parse(data)
+
+
+def _call_matches(tool_glob: str, when: dict, tool_name: str, args: dict) -> bool:
+    """Shared by rules and chains: tool glob matches and every condition holds."""
+    if not fnmatchcase(tool_name, tool_glob):
+        return False
+    for arg_name, (op, expected) in when.items():
+        if arg_name not in args:
+            return False
+        if not _check(op, args[arg_name], expected):
+            return False
+    return True
 
 
 def _check(op: str, actual, expected) -> bool:
@@ -134,29 +173,83 @@ def _parse(data) -> Rules:
     if not isinstance(raw_rules, list):
         raise RulesError("'rules' must be a list")
 
+    raw_chains = data.get("chains", [])
+    if not isinstance(raw_chains, list):
+        raise RulesError("'chains' must be a list")
+
     rules = [_parse_rule(i, raw) for i, raw in enumerate(raw_rules, start=1)]
-    return Rules(default=default, rules=rules)
+    chains = [_parse_chain(i, raw) for i, raw in enumerate(raw_chains, start=1)]
+    return Rules(default=default, rules=rules, chains=chains)
 
 
 def _parse_rule(index: int, raw) -> Rule:
+    label = _label("rule", index, raw)
+    _check_keys(label, raw, allowed=RULE_KEYS)
+    _check_strings(label, raw, ("name", "tool"))
+    _check_decision(label, raw.get("decision"))
+    return Rule(
+        name=raw["name"],
+        tool=raw["tool"],
+        decision=raw["decision"],
+        when=_parse_when(label, raw.get("when")),
+    )
+
+
+def _parse_chain(index: int, raw) -> Chain:
+    label = _label("chain", index, raw)
+    _check_keys(label, raw, allowed=CHAIN_KEYS, required=CHAIN_KEYS)
+    _check_strings(label, raw, ("name",))
+
+    after, then = raw["after"], raw["then"]
+    _check_keys(f"{label} after", after, allowed={"tool", "when"}, required={"tool"})
+    _check_strings(f"{label} after", after, ("tool",))
+    _check_keys(f"{label} then", then, allowed={"tool", "decision"}, required={"tool"})
+    _check_strings(f"{label} then", then, ("tool",))
+    _check_decision(f"{label} then", then.get("decision"))
+
+    return Chain(
+        name=raw["name"],
+        after_tool=after["tool"],
+        after_when=_parse_when(label, after.get("when")),
+        then_tool=then["tool"],
+        decision=then["decision"],
+    )
+
+
+def _label(kind: str, index: int, raw) -> str:
+    """e.g. "rule 'no-deletes' (#1)", used at the start of error messages."""
+    if isinstance(raw, dict) and "name" in raw:
+        return f"{kind} {raw['name']!r} (#{index})"
+    return f"{kind} #{index}"
+
+
+def _check_keys(label: str, raw, allowed: set, required: set = frozenset()) -> None:
     if not isinstance(raw, dict):
-        raise RulesError(f"rule #{index}: must be a mapping")
-
-    label = f"rule {raw['name']!r} (#{index})" if "name" in raw else f"rule #{index}"
-
-    unknown = set(raw) - RULE_KEYS
+        raise RulesError(f"{label}: must be a mapping")
+    unknown = set(raw) - allowed
     if unknown:
         raise RulesError(f"{label}: unknown key(s) {sorted(unknown)}")
-    for key in ("name", "tool"):
+    missing = required - set(raw)
+    if missing:
+        raise RulesError(f"{label}: missing key(s) {sorted(missing)}")
+
+
+def _check_strings(label: str, raw: dict, keys) -> None:
+    for key in keys:
         if not isinstance(raw.get(key), str):
             raise RulesError(f"{label}: '{key}' must be a string")
-    if raw.get("decision") not in DECISIONS:
+
+
+def _check_decision(label: str, decision) -> None:
+    if decision not in DECISIONS:
         raise RulesError(
-            f"{label}: decision must be one of {sorted(DECISIONS)},"
-            f" got {raw.get('decision')!r}"
+            f"{label}: decision must be one of {sorted(DECISIONS)}, got {decision!r}"
         )
 
-    raw_when = raw.get("when") or {}
+
+def _parse_when(label: str, raw_when) -> dict[str, tuple[str, object]]:
+    """Parse a `when` mapping. Shared by rules and chains."""
+    raw_when = raw_when or {}
     if not isinstance(raw_when, dict):
         raise RulesError(f"{label}: 'when' must be a mapping")
 
@@ -174,5 +267,4 @@ def _parse_rule(index: int, raw) -> Rule:
                 f"{label}: unknown condition {op!r}; use one of {list(CONDITIONS)}"
             )
         when[arg_name] = (op, expected)
-
-    return Rule(name=raw["name"], tool=raw["tool"], decision=raw["decision"], when=when)
+    return when

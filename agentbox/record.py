@@ -6,7 +6,7 @@ import logging
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from sqlite3 import Connection
@@ -46,6 +46,8 @@ class _RunState:
     run_id: str
     conn: Connection
     step: int = 0
+    # Names of chain rules fired in this run. Per run, so runs don't share them.
+    fired_chains: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -152,7 +154,8 @@ def _guard(call: _Call) -> None:
     """Check the rules. If not allowed, save the attempt and raise GuardBlocked."""
     if _rules is None:
         return
-    decision = _rules.decide(call.tool_name, call.args)
+    fired = call.state.fired_chains if call.state is not None else set()
+    decision = _rules.decide(call.tool_name, call.args, fired)
     call.rule_name = decision.rule_name
     if decision.decision == "allow":
         return
@@ -172,6 +175,9 @@ def _finish(call: _Call, result=store.NO_RESULT, error: Exception | None = None)
         result=result,
         error=None if error is None else f"{type(error).__name__}: {error}",
     )
+    # Only a successful call fires chains; blocked calls never get here.
+    if error is None and _rules is not None:
+        call.state.fired_chains |= _rules.chains_fired_by(call.tool_name, call.args)
 
 
 def _save(call: _Call, *, status: str, duration_ms: int, **extra) -> None:

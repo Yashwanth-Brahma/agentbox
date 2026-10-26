@@ -2,7 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from agentbox.rules import Decision, RulesError, _is_number, _to_number, load_rules
+from agentbox.rules import (
+    Decision,
+    RulesError,
+    _call_matches,
+    _is_number,
+    _label,
+    _to_number,
+    load_rules,
+)
 
 EXAMPLE = Path(__file__).parent.parent / "rules.yaml"
 
@@ -213,3 +221,134 @@ def test_to_number_rejects(text):
 )
 def test_is_number(value, expected):
     assert _is_number(value) is expected
+
+
+# --- chain rules ---
+
+CHAINS = """
+rules:
+  - {name: allow-email, tool: send_email, decision: allow}
+chains:
+  - name: no-send-after-secrets
+    after:
+      tool: read_file
+      when:
+        path: { matches: "*.env*" }
+    then:
+      tool: "send_*"
+      decision: block
+"""
+
+
+def test_fired_chain_decides_then_tool(load):
+    rules = load(CHAINS)
+    fired = {"no-send-after-secrets"}
+    assert rules.decide("send_email", {}, fired) == Decision(
+        "block", "no-send-after-secrets"
+    )
+    assert rules.decide("send_sms", {}, fired).decision == "block"
+
+
+def test_unfired_chain_has_no_effect(load):
+    rules = load(CHAINS)
+    assert rules.decide("send_email", {}) == Decision("allow", "allow-email")
+    assert rules.decide("send_sms", {}) == Decision("allow", None)
+
+
+def test_chain_is_checked_before_normal_rules(load):
+    # allow-email would allow send_email, but the fired chain wins.
+    rules = load(CHAINS)
+    decision = rules.decide("send_email", {}, {"no-send-after-secrets"})
+    assert decision.rule_name == "no-send-after-secrets"
+
+
+def test_fired_chain_ignores_other_tools(load):
+    rules = load(CHAINS)
+    fired = {"no-send-after-secrets"}
+    assert rules.decide("read_file", {"path": "a"}, fired) == Decision("allow", None)
+
+
+def test_chains_fired_by_uses_when(load):
+    rules = load(CHAINS)
+    assert rules.chains_fired_by("read_file", {"path": "/app/.env"}) == {
+        "no-send-after-secrets"
+    }
+    assert rules.chains_fired_by("read_file", {"path": "notes.txt"}) == set()
+    assert rules.chains_fired_by("read_file", {}) == set()
+    assert rules.chains_fired_by("get_user", {"path": ".env"}) == set()
+
+
+def test_chain_after_without_when(load):
+    rules = load(
+        "chains:\n  - {name: c, after: {tool: 'read_*'},"
+        " then: {tool: send_email, decision: ask}}\n"
+    )
+    assert rules.chains_fired_by("read_db", {}) == {"c"}
+    assert rules.decide("send_email", {}, {"c"}) == Decision("ask", "c")
+
+
+@pytest.mark.parametrize(
+    ("chains", "message"),
+    [
+        ("chains: {a: 1}", "'chains' must be a list"),
+        (
+            (
+                "chains:\n  - {name: c, after: {tool: x}, then: {tool: y, decision: block},"
+                " extra: 1}"
+            ),
+            "chain 'c' \\(#1\\): unknown key",
+        ),
+        (
+            "chains:\n  - {name: c, then: {tool: y, decision: block}}",
+            "chain 'c' \\(#1\\): missing key",
+        ),
+        (
+            (
+                "chains:\n  - {name: c, after: {tool: x},"
+                " then: {tool: y, decision: block, when: {}}}"
+            ),
+            "chain 'c' \\(#1\\) then: unknown key",
+        ),
+        (
+            "chains:\n  - {name: c, after: {tool: x}, then: {tool: y, decision: nope}}",
+            "chain 'c' \\(#1\\) then: decision must be one of",
+        ),
+        (
+            (
+                "chains:\n  - {name: c, after: {tool: x, when: {p: {equals: 1}}},"
+                " then: {tool: y, decision: block}}"
+            ),
+            "chain 'c' \\(#1\\): unknown condition 'equals'",
+        ),
+        (
+            "chains:\n  - {name: c, after: x, then: {tool: y, decision: block}}",
+            "chain 'c' \\(#1\\) after: must be a mapping",
+        ),
+    ],
+)
+def test_bad_chains(load, chains, message):
+    with pytest.raises(RulesError, match=message):
+        load(chains)
+
+
+def test_example_rules_file_chain():
+    rules = load_rules(EXAMPLE)
+    fired = rules.chains_fired_by("read_file", {"path": ".env"})
+    assert fired == {"no-send-after-secrets"}
+    assert rules.decide("send_email", {}, fired) == Decision(
+        "block", "no-send-after-secrets"
+    )
+
+
+def test_call_matches():
+    when = {"path": ("matches", "*.env")}
+    assert _call_matches("read_*", when, "read_file", {"path": "a.env"})
+    assert not _call_matches("read_*", when, "read_file", {"path": "a.txt"})
+    assert not _call_matches("read_*", when, "write_file", {"path": "a.env"})
+    assert not _call_matches("read_*", when, "read_file", {})
+
+
+def test_label():
+    assert _label("chain", 2, {"name": "c"}) == "chain 'c' (#2)"
+    assert _label("rule", 1, {}) == "rule #1"
+    assert _label("rule", 1, "not a dict") == "rule #1"
