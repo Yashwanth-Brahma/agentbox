@@ -150,6 +150,7 @@ def test_get_action_found(conn):
         "status": "ok",
         "started_at": T0,
         "duration_ms": 5,
+        "rule_name": None,
         "has_result": True,
         "result": {"text": "hi"},
     }
@@ -157,3 +158,37 @@ def test_get_action_found(conn):
 
 def test_get_action_missing(conn):
     assert store.get_action(conn, "no-such-id") is None
+
+
+def test_save_action_with_rule_name(conn):
+    run_id = store.start_run(conn, "r")
+    action_id = add_action(conn, run_id, status="blocked", rule_name="no-deletes")
+    assert store.get_action(conn, action_id)["rule_name"] == "no-deletes"
+
+
+def test_connect_adds_rule_name_to_old_database(tmp_path):
+    db_path = tmp_path / "old.db"
+    old = sqlite3.connect(db_path)
+    old.executescript(
+        """
+        CREATE TABLE runs (id TEXT PRIMARY KEY, started_at TEXT NOT NULL,
+                           name TEXT NOT NULL);
+        CREATE TABLE actions (
+            id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+            step INTEGER NOT NULL, tool_name TEXT NOT NULL,
+            args_json TEXT NOT NULL, result_json TEXT, error TEXT,
+            status TEXT NOT NULL, started_at TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL
+        );
+        """
+    )
+    old.close()
+
+    conn = store.connect(db_path)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(actions)")}
+    assert "rule_name" in columns
+
+    run_id = store.start_run(conn, "r")
+    action_id = add_action(conn, run_id, rule_name="r1")
+    assert store.get_action(conn, action_id)["rule_name"] == "r1"
+    conn.close()

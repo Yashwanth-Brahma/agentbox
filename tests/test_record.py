@@ -1,10 +1,12 @@
 import asyncio
 import importlib
 import logging
+from pathlib import Path
 
 import pytest
 
-from agentbox import record, run, store
+from agentbox import GuardBlocked, configure, record, run, store
+from agentbox.rules import RulesError
 
 # `agentbox.record` is shadowed by the decorator in __init__, so fetch the module.
 record_module = importlib.import_module("agentbox.record")
@@ -38,8 +40,10 @@ def db_path(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def reset_warning():
+def reset_module_state():
     record_module._warned = False
+    yield
+    configure(rules=None)
 
 
 def actions_for(db_path, run_id):
@@ -157,3 +161,178 @@ def test_package_exports():
 
     assert agentbox.run is run
     assert agentbox.record is record
+
+
+# --- rules connected to @record ---
+
+
+@record
+def write_file(path, text):
+    Path(path).write_text(text)
+    return "written"
+
+
+@record
+async def write_file_async(path, text):
+    await asyncio.sleep(0)
+    Path(path).write_text(text)
+    return "written"
+
+
+RULES = """
+rules:
+  - name: allow-notes
+    tool: "write_*"
+    when:
+      path: { matches: "*notes.txt" }
+    decision: allow
+  - name: ask-secrets
+    tool: "write_*"
+    when:
+      path: { matches: "*secret*" }
+    decision: ask
+  - name: no-writes
+    tool: "write_*"
+    decision: block
+"""
+
+
+@pytest.fixture
+def use_rules(tmp_path):
+    def _use(text=RULES):
+        path = tmp_path / "rules.yaml"
+        path.write_text(text)
+        configure(rules=path)
+
+    return _use
+
+
+def test_no_rules_allows_everything(db_path, tmp_path):
+    target = tmp_path / "out.txt"
+    with run("r", db_path=db_path) as run_id:
+        assert write_file(str(target), "hi") == "written"
+
+    assert target.read_text() == "hi"
+    [action] = actions_for(db_path, run_id)
+    assert action["status"] == "ok"
+    assert action["rule_name"] is None
+
+
+def test_blocked_tool_does_not_run(db_path, tmp_path, use_rules):
+    use_rules()
+    target = tmp_path / "out.txt"
+    with run("r", db_path=db_path) as run_id, pytest.raises(GuardBlocked) as caught:
+        write_file(str(target), "hi")
+
+    assert not target.exists()
+    assert str(caught.value) == "write_file blocked by rule 'no-writes'"
+    assert caught.value.decision == "block"
+    assert caught.value.rule_name == "no-writes"
+    [action] = actions_for(db_path, run_id)
+    assert action["status"] == "blocked"
+    assert action["rule_name"] == "no-writes"
+    assert action["has_result"] is False
+    assert action["error"] is None
+    assert action["step"] == 1
+
+
+def test_ask_is_saved_as_needs_approval(db_path, tmp_path, use_rules):
+    use_rules()
+    target = tmp_path / "secret.txt"
+    with run("r", db_path=db_path) as run_id, pytest.raises(GuardBlocked) as caught:
+        write_file(str(target), "hi")
+
+    assert not target.exists()
+    assert caught.value.decision == "ask"
+    assert str(caught.value) == "write_file needs approval (rule 'ask-secrets')"
+    [action] = actions_for(db_path, run_id)
+    assert action["status"] == "needs_approval"
+    assert action["rule_name"] == "ask-secrets"
+
+
+def test_allowed_by_rule_runs_and_saves_rule_name(db_path, tmp_path, use_rules):
+    use_rules()
+    target = tmp_path / "notes.txt"
+    with run("r", db_path=db_path) as run_id:
+        assert write_file(str(target), "hi") == "written"
+
+    assert target.read_text() == "hi"
+    [action] = actions_for(db_path, run_id)
+    assert action["status"] == "ok"
+    assert action["rule_name"] == "allow-notes"
+    assert action["result"] == "written"
+
+
+def test_default_block(db_path, use_rules):
+    use_rules("default: block\n")
+    with run("r", db_path=db_path) as run_id, pytest.raises(GuardBlocked) as caught:
+        add(1, 2)
+
+    assert str(caught.value) == "add blocked by default"
+    [action] = actions_for(db_path, run_id)
+    assert action["status"] == "blocked"
+    assert action["rule_name"] is None
+
+
+def test_async_blocked_tool_does_not_run(db_path, tmp_path, use_rules):
+    use_rules()
+    target = tmp_path / "out.txt"
+    with run("r", db_path=db_path) as run_id, pytest.raises(GuardBlocked):
+        asyncio.run(write_file_async(str(target), "hi"))
+
+    assert not target.exists()
+    [action] = actions_for(db_path, run_id)
+    assert action["status"] == "blocked"
+    assert action["tool_name"] == "write_file_async"
+
+
+def test_async_allowed_tool_runs(db_path, tmp_path, use_rules):
+    use_rules()
+    target = tmp_path / "notes.txt"
+    with run("r", db_path=db_path) as run_id:
+        assert asyncio.run(write_file_async(str(target), "hi")) == "written"
+
+    assert target.read_text() == "hi"
+    [action] = actions_for(db_path, run_id)
+    assert action["status"] == "ok"
+
+
+def test_blocked_outside_run_still_enforced(tmp_path, use_rules):
+    use_rules()
+    target = tmp_path / "out.txt"
+    with pytest.raises(GuardBlocked):
+        write_file(str(target), "hi")
+    assert not target.exists()
+
+
+def test_blocked_call_uses_a_step(db_path, tmp_path, use_rules):
+    use_rules()
+    with run("r", db_path=db_path) as run_id:
+        with pytest.raises(GuardBlocked):
+            write_file(str(tmp_path / "out.txt"), "hi")
+        write_file(str(tmp_path / "notes.txt"), "hi")
+
+    actions = actions_for(db_path, run_id)
+    assert [(a["step"], a["status"]) for a in actions] == [(1, "blocked"), (2, "ok")]
+
+
+def test_configure_none_allows_everything_again(tmp_path, use_rules):
+    use_rules()
+    configure(rules=None)
+    target = tmp_path / "out.txt"
+    write_file(str(target), "hi")
+    assert target.exists()
+
+
+def test_configure_bad_file_raises(tmp_path):
+    path = tmp_path / "rules.yaml"
+    path.write_text("default: maybe\n")
+    with pytest.raises(RulesError):
+        configure(rules=path)
+
+
+def test_package_exports_guard():
+    import agentbox
+
+    assert agentbox.configure is configure
+    assert agentbox.GuardBlocked is GuardBlocked

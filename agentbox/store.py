@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS actions (
     error TEXT,
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
-    duration_ms INTEGER NOT NULL
+    duration_ms INTEGER NOT NULL,
+    rule_name TEXT
 );
 """
 
@@ -38,7 +39,17 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     # SQLite ignores REFERENCES unless this is turned on for each connection.
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)
     return conn
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Upgrade databases created before a column existed."""
+    # CREATE TABLE IF NOT EXISTS skips existing tables, so new columns need ALTER.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(actions)")}
+    if "rule_name" not in columns:
+        with conn:
+            conn.execute("ALTER TABLE actions ADD COLUMN rule_name TEXT")
 
 
 def start_run(conn: sqlite3.Connection, name: str) -> str:
@@ -65,6 +76,7 @@ def save_action(
     duration_ms: int,
     result: object = NO_RESULT,
     error: str | None = None,
+    rule_name: str | None = None,
 ) -> str:
     """Save one tool call for a run and return its id.
 
@@ -75,9 +87,9 @@ def save_action(
     with conn:
         conn.execute(
             """
-            INSERT INTO actions (id, run_id, step, tool_name, args_json,
-                                 result_json, error, status, started_at, duration_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO actions (id, run_id, step, tool_name, args_json, result_json,
+                                 error, status, started_at, duration_ms, rule_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 action_id,
@@ -90,6 +102,7 @@ def save_action(
                 status,
                 started_at,
                 duration_ms,
+                rule_name,
             ),
         )
     return action_id
